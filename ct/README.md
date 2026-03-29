@@ -12,6 +12,3 @@ Container-side update scripts for Docker Compose stacks in Proxmox LXCs.
 ```bash
 bash install/install-ct-scripts.sh all
 ```
-
-## License
-This project is licensed under the MIT License. See the LICENSE file for details.
