@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/ctupdate/ctupdate.conf}"
+
+MANAGED_LIST="/etc/ctupdate/managed_cts.conf"
+IGNORE_FILE="/etc/ctupdate/ignore.conf"
+UPDATE_SCRIPT_PATH="/usr/local/bin/update"
+CHECK_SCRIPT_PATH="/usr/local/bin/check-updates"
+RUNNING_ONLY="true"
+INTERACTIVE_CMD="whiptail"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+usage() {
+  cat <<EOF
+Usage:
+  ctupdate <CTID> [CTID...]
+  ctupdate list [-i]
+  ctupdate all
+
+Commands:
+  ctupdate <CTID> [CTID...]   Update one or more specific CTs
+  ctupdate list               Refresh managed CT list and show update status
+  ctupdate list -i            Refresh managed CT list, show status, then prompt interactively
+  ctupdate all                Update all CTs from managed list
+
+Environment/config options:
+  MANAGED_LIST
+  IGNORE_FILE
+  UPDATE_SCRIPT_PATH
+  CHECK_SCRIPT_PATH
+  RUNNING_ONLY
+  INTERACTIVE_CMD
+EOF
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "❌ Missing required command: $1"
+    exit 1
+  }
+}
+
+ct_exists() {
+  local ctid="$1"
+  pct config "$ctid" >/dev/null 2>&1
+}
+
+ct_status() {
+  local ctid="$1"
+  pct status "$ctid" 2>/dev/null | awk '{print $2}'
+}
+
+ct_hostname() {
+  local ctid="$1"
+  pct config "$ctid" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}'
+}
+
+ct_has_file() {
+  local ctid="$1"
+  local path="$2"
+  pct exec "$ctid" -- sh -c "[ -f '$path' ]" >/dev/null 2>&1
+}
+
+ct_has_executable() {
+  local ctid="$1"
+  local path="$2"
+  pct exec "$ctid" -- sh -c "[ -x '$path' ]" >/dev/null 2>&1
+}
+
+is_ignored() {
+  local ctid="$1"
+  [ -f "$IGNORE_FILE" ] || return 1
+  grep -qx "$ctid" "$IGNORE_FILE" 2>/dev/null
+}
+
+discover_cts() {
+  while read -r ctid _; do
+    [ -n "${ctid:-}" ] || continue
+    [ "$ctid" = "VMID" ] && continue
+
+    if is_ignored "$ctid"; then
+      continue
+    fi
+
+    if [ "$RUNNING_ONLY" = "true" ] && [ "$(ct_status "$ctid" || true)" != "running" ]; then
+      continue
+    fi
+
+    if ct_has_executable "$ctid" "$UPDATE_SCRIPT_PATH"; then
+      echo "$ctid $(ct_hostname "$ctid")"
+    fi
+  done < <(pct list)
+}
+
+refresh_list() {
+  local tmpfile
+  tmpfile="$(mktemp)"
+  discover_cts | sort -n > "$tmpfile"
+  mkdir -p "$(dirname "$MANAGED_LIST")"
+  mv "$tmpfile" "$MANAGED_LIST"
+  chmod 644 "$MANAGED_LIST"
+
+  echo "✅ Refreshed $MANAGED_LIST"
+  echo
+}
+
+pretty_check_output() {
+  local ctid="$1"
+  local name="$2"
+  local raw
+  local updates=0
+  local shown=0
+
+  echo "=== CT $ctid (${name:-unknown}) ==="
+
+  if ! ct_has_file "$ctid" "$CHECK_SCRIPT_PATH"; then
+    echo "check-updates script missing"
+    echo
+    return 0
+  fi
+
+  raw="$(pct exec "$ctid" -- bash "$CHECK_SCRIPT_PATH" 2>/dev/null || true)"
+
+  if [ -z "$raw" ]; then
+    echo "No compose stacks found or no services detected."
+    echo
+    return 0
+  fi
+
+  while IFS='|' read -r project svc status current available image; do
+    [ -n "${project:-}" ] || continue
+    shown=1
+
+    case "$status" in
+      update-available)
+        updates=$((updates + 1))
+        ;;
+    esac
+
+    printf "  %-16s %-18s %s\n" "$svc" "$status" "$image"
+  done <<< "$raw"
+
+  if [ "$shown" -eq 0 ]; then
+    echo "No results."
+  fi
+
+  if [ "$updates" -gt 0 ]; then
+    echo
+    echo "  ⚠ $updates update(s) available"
+  else
+    echo
+    echo "  ✔ No updates available"
+  fi
+
+  echo
+}
+
+run_update() {
+  local ctid="$1"
+  local name="${2:-}"
+
+  echo "=============================="
+  echo "🔄 Updating CT $ctid ${name:+($name)}"
+  echo "=============================="
+
+  if ! ct_exists "$ctid"; then
+    echo "❌ CT $ctid does not exist"
+    echo
+    return 1
+  fi
+
+  if [ "$(ct_status "$ctid")" != "running" ]; then
+    echo "⚠️  CT $ctid is not running"
+    echo
+    return 1
+  fi
+
+  if ! ct_has_executable "$ctid" "$UPDATE_SCRIPT_PATH"; then
+    echo "⚠️  CT $ctid does not have $UPDATE_SCRIPT_PATH"
+    echo
+    return 1
+  fi
+
+  pct exec "$ctid" -- bash "$UPDATE_SCRIPT_PATH"
+  echo
+}
+
+interactive_pick() {
+  require_cmd "$INTERACTIVE_CMD"
+
+  [ -f "$MANAGED_LIST" ] || {
+    echo "⚠️  Managed list not found. Run: ctupdate list"
+    exit 1
+  }
+
+  local options=()
+  while read -r ctid name; do
+    [ -n "${ctid:-}" ] || continue
+    options+=("$ctid" "${name:-ct$ctid}" "OFF")
+  done < "$MANAGED_LIST"
+
+  [ "${#options[@]}" -gt 0 ] || {
+    echo "No CTs available."
+    exit 1
+  }
+
+  local selected
+  selected=$(
+    "$INTERACTIVE_CMD" --title "ctupdate" \
+      --checklist "Select CTs to update" 20 80 12 \
+      "${options[@]}" \
+      3>&1 1>&2 2>&3
+  ) || exit 0
+
+  [ -n "$selected" ] || exit 0
+
+  local rc=0
+  for ctid in $selected; do
+    ctid="${ctid//\"/}"
+    run_update "$ctid" "$(ct_hostname "$ctid")" || rc=1
+  done
+  exit "$rc"
+}
+
+list_cts() {
+  refresh_list
+
+  [ -f "$MANAGED_LIST" ] || exit 0
+
+  while read -r ctid name; do
+    [ -n "${ctid:-}" ] || continue
+    pretty_check_output "$ctid" "$name"
+  done < "$MANAGED_LIST"
+}
+
+update_all() {
+  [ -f "$MANAGED_LIST" ] || {
+    echo "⚠️  Managed list not found. Run: ctupdate list"
+    exit 1
+  }
+
+  local rc=0
+  while read -r ctid name; do
+    [ -n "${ctid:-}" ] || continue
+    run_update "$ctid" "$name" || rc=1
+  done < "$MANAGED_LIST"
+
+  exit "$rc"
+}
+
+main() {
+  require_cmd pct
+  require_cmd bash
+
+  [ "$#" -gt 0 ] || {
+    usage
+    exit 1
+  }
+
+  case "$1" in
+    list)
+      list_cts
+      shift || true
+      if [ "${1:-}" = "-i" ]; then
+        interactive_pick
+      fi
+      ;;
+    all)
+      update_all
+      ;;
+    *)
+      local rc=0
+      for ctid in "$@"; do
+        run_update "$ctid" "$(ct_hostname "$ctid")" || rc=1
+      done
+      exit "$rc"
+      ;;
+  esac
+}
+
+main "$@"

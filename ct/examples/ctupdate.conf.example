@@ -1,0 +1,4 @@
+STACK_DIR="/opt/stacks"
+COMPOSE_FILES="compose.yml compose.yaml docker-compose.yml"
+PRUNE_IMAGES="true"
+PULL_ON_CHECK="true"

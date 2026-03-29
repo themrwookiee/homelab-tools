@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/ctupdate/ctupdate.conf}"
+
+STACK_DIR="/opt/stacks"
+COMPOSE_FILES="compose.yml compose.yaml docker-compose.yml"
+PULL_ON_CHECK="true"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+find_compose_file() {
+  local dir="$1"
+  local file
+  for file in $COMPOSE_FILES; do
+    if [ -f "$dir/$file" ]; then
+      echo "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ ! -d "$STACK_DIR" ]; then
+  exit 0
+fi
+
+for dir in "$STACK_DIR"/*; do
+  [ -d "$dir" ] || continue
+
+  compose_file="$(find_compose_file "$dir" || true)"
+  [ -n "${compose_file:-}" ] || continue
+
+  cd "$dir"
+
+  project="$(basename "$dir")"
+  services="$(docker compose -f "$compose_file" config --services 2>/dev/null || true)"
+  [ -n "$services" ] || continue
+
+  if [ "$PULL_ON_CHECK" = "true" ]; then
+    docker compose -f "$compose_file" pull --quiet >/dev/null 2>&1 || true
+  fi
+
+  for svc in $services; do
+    cid="$(docker compose -f "$compose_file" ps -q "$svc" 2>/dev/null || true)"
+
+    if [ -n "$cid" ]; then
+      current_id="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
+      image_name="$(docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
+      current_tag="${image_name:-unknown}"
+    else
+      current_id=""
+      image_name="$(docker compose -f "$compose_file" config 2>/dev/null | awk -v s="$svc" '
+        $1 == s ":" {found=1; next}
+        found && $1 == "image:" {print $2; exit}
+      ')"
+      current_tag="${image_name:-unknown}"
+    fi
+
+    [ -n "$image_name" ] || continue
+
+    available_id="$(docker image inspect "$image_name" -f '{{.Id}}' 2>/dev/null || true)"
+
+    if [ -z "$cid" ]; then
+      status="not-running"
+    elif [ -z "$available_id" ]; then
+      status="unknown"
+    elif [ "$current_id" != "$available_id" ]; then
+      status="update-available"
+    else
+      status="up-to-date"
+    fi
+
+    echo "$project|$svc|$status|${current_id:-n/a}|${available_id:-n/a}|$current_tag"
+  done
+done

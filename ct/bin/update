@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/ctupdate/ctupdate.conf}"
+
+STACK_DIR="/opt/stacks"
+COMPOSE_FILES="compose.yml compose.yaml docker-compose.yml"
+PRUNE_IMAGES="true"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+find_compose_file() {
+  local dir="$1"
+  local file
+  for file in $COMPOSE_FILES; do
+    if [ -f "$dir/$file" ]; then
+      echo "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+echo "🔄 Updating Docker stacks in $STACK_DIR"
+echo
+
+if [ ! -d "$STACK_DIR" ]; then
+  echo "⚠️  Stack directory not found: $STACK_DIR"
+  exit 0
+fi
+
+found=0
+
+for dir in "$STACK_DIR"/*; do
+  [ -d "$dir" ] || continue
+
+  compose_file="$(find_compose_file "$dir" || true)"
+  [ -n "${compose_file:-}" ] || continue
+
+  found=1
+
+  echo "➡️  Updating $(basename "$dir")"
+  cd "$dir"
+
+  docker compose -f "$compose_file" pull
+  docker compose -f "$compose_file" up -d
+
+  echo "✅ $(basename "$dir") done"
+  echo
+done
+
+if [ "$found" -eq 0 ]; then
+  echo "⚠️  No compose files found under $STACK_DIR"
+  echo
+fi
+
+if [ "$PRUNE_IMAGES" = "true" ]; then
+  echo "🧹 Cleaning unused images"
+  docker image prune -f
+  echo
+fi
+
+echo "🎉 Update complete"

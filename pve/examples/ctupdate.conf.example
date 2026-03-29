@@ -1,0 +1,6 @@
+MANAGED_LIST="/etc/ctupdate/managed_cts.conf"
+IGNORE_FILE="/etc/ctupdate/ignore.conf"
+UPDATE_SCRIPT_PATH="/usr/local/bin/update"
+CHECK_SCRIPT_PATH="/usr/local/bin/check-updates"
+RUNNING_ONLY="true"
+INTERACTIVE_CMD="whiptail"
